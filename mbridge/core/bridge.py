@@ -153,6 +153,7 @@ class Bridge(ABC):
         for i, model in enumerate(models):
             # map local weight names to global weight names
             local_to_global_map = self._weight_name_mapping_mcore_local_to_global(model)
+            print(f"zyzyzy mb local_to_global_map: {local_to_global_map}")
             # map local weight names to huggingface weight names
             local_to_hf_map = {
                 k: self._weight_name_mapping_mcore_to_hf(v)
