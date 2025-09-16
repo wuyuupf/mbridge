@@ -13,13 +13,10 @@ Classes:
     DeepseekV3Bridge: Bridge implementation for DeepseekV3 models
     MimoBridge: Bridge implementation for MIMO models
 """
-# isort: off
-# fmt: off
 
+# fmt: off
+# isort: off
 from .deepseek_v3 import DeepseekV3Bridge
-from .gemma3 import Gemma3Bridge
-from .glm4_vl import Glm4VLBridgeDense, Glm4VLBridgeMoe
-from .glm4moe import GLM4MoEBridge
 from .llama import LLaMABridge
 from .mimo import MimoBridge
 from .mixtral import MixtralBridge
@@ -29,3 +26,6 @@ from .qwen2moe import Qwen2MoEBridge
 from .qwen3 import Qwen3Bridge
 from .qwen3moe import Qwen3MoEBridge
 from .qwen3next import Qwen3NextBridge
+from .gemma3 import Gemma3Bridge # isort:skip
+from .glm4_vl import Glm4VLBridgeDense, Glm4VLBridgeMoe # isort:skip
+from .glm4moe import GLM4MoEBridge# isort:skip
