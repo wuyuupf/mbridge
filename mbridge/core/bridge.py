@@ -4,6 +4,7 @@ from abc import ABC
 from typing import Callable, Generator
 
 import torch
+import torch.distributed as dist
 from megatron.core.models.gpt.gpt_model import ModelType
 from transformers import AutoConfig
 from transformers.utils.hub import cached_file
@@ -149,18 +150,33 @@ class Bridge(ABC):
             weights_path: Path to the weights file or Hugging Face model identifier
         """
         self.safetensor_io = self._get_safetensor_io(weights_path)
+        from dataclasses import asdict
+        from pprint import pprint
 
         for i, model in enumerate(models):
             # map local weight names to global weight names
             local_to_global_map = self._weight_name_mapping_mcore_local_to_global(model)
-            for k, v in local_to_global_map.items():
-                print(f"[zyzyzy mb local_to_global_map new one!] {k}: {v}")
+
+            print("""#######################################""")
+            print("""#######################################""")
+            pprint(
+                f"{dist.get_rank()=} local_to_global_map: {local_to_global_map}",
+                sort_dicts=False,
+            )
             # map local weight names to huggingface weight names
             local_to_hf_map = {
                 k: self._weight_name_mapping_mcore_to_hf(v)
                 for k, v in local_to_global_map.items()
                 if "_extra_state" not in k
             }
+
+            print("""#######################################""")
+            print("""#######################################""")
+            pprint(
+                f"{dist.get_rank()=} local_to_hf_map: {local_to_hf_map}",
+                sort_dicts=False,
+            )
+
             # only tp_rank0/etp_rank0 load from disk, others load from tp_rank0/etp_rank0
             to_load_from_disk = []
             for local_name, hf_names in local_to_hf_map.items():
@@ -175,6 +191,13 @@ class Bridge(ABC):
                         # if make value model, every tp rank will load lm_head.weight
                         if "lm_head.weight" in hf_names:
                             to_load_from_disk.extend(hf_names)
+
+            print("""#######################################""")
+            print("""#######################################""")
+            pprint(
+                f"{dist.get_rank()=} to_load_from_disk: {to_load_from_disk}",
+                sort_dicts=False,
+            )
 
             # load huggingface weights
             if not memory_efficient:
