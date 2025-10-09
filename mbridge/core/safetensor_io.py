@@ -104,10 +104,14 @@ class SafeTensorIO:
         filename_to_keys_map = defaultdict(set)
         for key, filename in self.index.items():
             filename_to_keys_map[filename].add(key)
+        print(f"[safetonsor io] filename_to_keys_map: {filename_to_keys_map}")
         states = {}
         for hf_weight_name, tensor in per_tensor_generator:
             states[hf_weight_name] = tensor.cpu()
+            print(f"[safetonsor io] hf_weight_name: {hf_weight_name}")
             for filename, keys_for_file in filename_to_keys_map.items():
+                print(f"[safetonsor io] keys_for_file: {keys_for_file}")
+                print(f"[safetonsor io] states.keys(): {states.keys()}")
                 if keys_for_file.issubset(states.keys()):
                     to_save = {k: states[k] for k in keys_for_file}
                     safetensor_file = os.path.join(new_hf_dir, filename)

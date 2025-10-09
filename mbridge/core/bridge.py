@@ -19,6 +19,139 @@ from .util import (
 )
 
 
+def _rank_tag(group=None):
+    try:
+        gr = dist.get_rank(group=group)
+    except Exception:
+        gr = None
+    return f"[global={dist.get_rank():02d} group={gr}]"
+
+
+def debug_scatter_param(
+    local_name,
+    param_to_load,
+    mcore_weights_tp_split,
+    tp_group,
+    group_src_local=0,
+    enforce_contiguous=True,
+):
+    """
+    Debug wrapper around dist.scatter that:
+      - Uses group-local src (group_src_local)
+      - Validates shapes/dtypes/devices
+      - Prints per-rank diagnostics
+      - Gathers and reports exceptions from all ranks
+    """
+    # Basic group info
+    gsize = dist.get_world_size(group=tp_group)
+    grank = dist.get_rank(group=tp_group)
+    is_src = grank == group_src_local
+    backend = dist.get_backend(tp_group)
+    need_cuda = backend == "nccl"
+
+    # Prepare scatter_list on src only
+    if is_src:
+        assert isinstance(
+            mcore_weights_tp_split, list
+        ), f"{_rank_tag(tp_group)} {local_name=} scatter_list must be list on src"
+        assert (
+            len(mcore_weights_tp_split) == gsize
+        ), f"{_rank_tag(tp_group)} {local_name=} scatter_list len={len(mcore_weights_tp_split)} != group size={gsize}"
+
+        # Ensure all shards match the receiver tensor’s meta
+        for i, t in enumerate(mcore_weights_tp_split):
+            assert isinstance(
+                t, torch.Tensor
+            ), f"{local_name=} scatter_list[{i}] is not a tensor"
+            if enforce_contiguous and not t.is_contiguous():
+                print(
+                    f"{_rank_tag(tp_group)} {local_name=} shard {i} is not contiguous, converting..."
+                )
+                mcore_weights_tp_split[i] = t = t.contiguous()
+            assert (
+                t.dtype == param_to_load.dtype
+            ), f"{_rank_tag(tp_group)} {local_name=} dtype mismatch at shard {i}: {t.dtype} vs recv {param_to_load.dtype}"
+            assert (
+                t.shape == param_to_load.shape
+            ), f"{[_rank_tag(tp_group)]} {local_name=} shape mismatch at shard {i}: {tuple(t.shape)} vs recv {tuple(param_to_load.shape)}"
+            if need_cuda:
+                assert (
+                    t.is_cuda and param_to_load.is_cuda
+                ), f"{_rank_tag(tp_group)} {local_name=} NCCL requires CUDA tensors (got {t.device}, recv {param_to_load.device})"
+            else:
+                # Gloo can do CPU
+                pass
+        scatter_list = [
+            t.contiguous() if enforce_contiguous else t for t in mcore_weights_tp_split
+        ]
+    else:
+        # MUST be None on non-src ranks
+        assert (
+            mcore_weights_tp_split is None
+        ), f"{_rank_tag(tp_group)} {local_name=} scatter_list must be None on non-src"
+        scatter_list = None
+
+    # Ensure receiver buffer matches requirements too
+    if enforce_contiguous and not param_to_load.is_contiguous():
+        print(
+            f"{_rank_tag(tp_group)} {local_name=} param_to_load is not contiguous, converting..."
+        )
+        param_to_load = param_to_load.contiguous()
+
+    # Print pre-scatter diagnostics
+    print(
+        _rank_tag(tp_group),
+        f"{local_name=} pre-scatter: is_src={is_src} backend={backend} "
+        f"recv(shape={tuple(param_to_load.shape)}, dtype={param_to_load.dtype}, dev={param_to_load.device}) "
+        f"list_len={None if scatter_list is None else len(scatter_list)}",
+        flush=True,
+    )
+    if is_src:
+        # Show first few shard metas
+        metas = ", ".join(
+            [
+                f"{i}:shape={tuple(t.shape)},dev={t.device},dtype={t.dtype}"
+                for i, t in enumerate(scatter_list[: min(4, len(scatter_list))])
+            ]
+        )
+        print(
+            _rank_tag(tp_group),
+            f"{local_name=}",
+            f"src shard metas (first up to 4): {metas}",
+            flush=True,
+        )
+
+    # Try the scatter and collect per-rank error messages
+    err = None
+    try:
+        # IMPORTANT: use group_src (local) when passing a group
+        dist.scatter(
+            tensor=param_to_load,
+            scatter_list=scatter_list,
+            group=tp_group,
+            group_src=group_src_local,
+        )
+        print(_rank_tag(tp_group), f"{local_name=} scatter OK", flush=True)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        print(_rank_tag(tp_group), f"{local_name=} scatter FAILED:", err, flush=True)
+
+    # Gather errors from all ranks to src for a compact report
+    all_errs = [None] * gsize
+    dist.all_gather_object(all_errs, err, group=tp_group)
+
+    if is_src:
+        summary = {i: e for i, e in enumerate(all_errs)}
+        print(
+            _rank_tag(tp_group),
+            f"{local_name=} scatter per-rank status (group-local ranks): {summary}",
+            flush=True,
+        )
+
+    # Return the (possibly re-contiguous) receive tensor for the caller
+    return param_to_load
+
+
 class Bridge(ABC):
     """
     Base model bridge class.
@@ -150,32 +283,17 @@ class Bridge(ABC):
             weights_path: Path to the weights file or Hugging Face model identifier
         """
         self.safetensor_io = self._get_safetensor_io(weights_path)
-        from dataclasses import asdict
-        from pprint import pprint
 
         for i, model in enumerate(models):
             # map local weight names to global weight names
             local_to_global_map = self._weight_name_mapping_mcore_local_to_global(model)
 
-            print("""#######################################""")
-            print("""#######################################""")
-            pprint(
-                f"{dist.get_rank()=} local_to_global_map: {local_to_global_map}",
-                sort_dicts=False,
-            )
             # map local weight names to huggingface weight names
             local_to_hf_map = {
                 k: self._weight_name_mapping_mcore_to_hf(v)
                 for k, v in local_to_global_map.items()
                 if "_extra_state" not in k
             }
-
-            print("""#######################################""")
-            print("""#######################################""")
-            pprint(
-                f"{dist.get_rank()=} local_to_hf_map: {local_to_hf_map}",
-                sort_dicts=False,
-            )
 
             # only tp_rank0/etp_rank0 load from disk, others load from tp_rank0/etp_rank0
             to_load_from_disk = []
@@ -192,13 +310,6 @@ class Bridge(ABC):
                         if "lm_head.weight" in hf_names:
                             to_load_from_disk.extend(hf_names)
 
-            print("""#######################################""")
-            print("""#######################################""")
-            pprint(
-                f"{dist.get_rank()=} to_load_from_disk: {to_load_from_disk}",
-                sort_dicts=False,
-            )
-
             # load huggingface weights
             if not memory_efficient:
                 hf_weights_map = self.safetensor_io.load_some_hf_weight(
@@ -207,6 +318,7 @@ class Bridge(ABC):
 
             # import mcore weights
             for local_name, hf_names in local_to_hf_map.items():
+                # print(f"into the loop {_rank_tag()} {local_name=} {hf_names=}")
                 param = model.state_dict()[local_name]
                 # hf format to mcore format
                 if set(to_load_from_disk) & set(hf_names):
@@ -223,6 +335,11 @@ class Bridge(ABC):
                     if param.shape[0] == 1 and mcore_weight.shape[0] != 1:
                         # skip lm_head.weight when the model is a value model
                         continue
+
+                # print(f"finished mcore format {_rank_tag()} {local_name=} {hf_names=}")
+
+                # hf_weights/mcore_weight stores the tensor read from safetensor; source of truth
+                # param/param_to_load reads from GPTModel; need adjust
 
                 param_to_load = torch.empty_like(param)
                 if ".mlp.experts.linear_fc" in local_name:
@@ -257,12 +374,43 @@ class Bridge(ABC):
                         ]
                     else:
                         mcore_weights_tp_split = None
+                    # len_mcore_weights_tp_split = (
+                    #     len(mcore_weights_tp_split) if mcore_weights_tp_split else 0
+                    # )
+                    # mcore_weights_tp_split_details = (
+                    #     [(x.shape, x.dtype, x.device) for x in mcore_weights_tp_split]
+                    #     if mcore_weights_tp_split
+                    #     else []
+                    # )
+                    # mcore_weight_shape = (
+                    #     mcore_weight.shape if mcore_weight is not None else None
+                    # )
+                    # print(
+                    #     f"""
+                    #     {_rank_tag()} {local_name=}
+                    #     {param.shape=}
+                    #     {mcore_weight_shape=}
+                    #     {len_mcore_weights_tp_split=}
+                    #     {mcore_weights_tp_split_details=}
+                    #     """
+                    # )
                     torch.distributed.scatter(
                         param_to_load,
                         mcore_weights_tp_split,
                         src=torch.distributed.get_global_rank(self.mpu.tp_group, 0),
                         group=self.mpu.tp_group,
                     )
+                    # param_to_load = debug_scatter_param(
+                    #     local_name,
+                    #     param_to_load,
+                    #     mcore_weights_tp_split,
+                    #     self.mpu.tp_group,
+                    #     group_src_local=0,
+                    #     enforce_contiguous=True,
+                    # )
+                    # print(
+                    #     f"finished param loading {_rank_tag()} {local_name=} {hf_names=}"
+                    # )
                 # load
                 param.copy_(param_to_load)
 
@@ -911,7 +1059,9 @@ class Bridge(ABC):
         else:
             if param.shape == mcore_weights.shape:
                 return [mcore_weights for _ in range(tp_split_size)]
-            assert len(param.shape) == len(mcore_weights.shape)
+            assert len(param.shape) == len(
+                mcore_weights.shape
+            ), f"{_rank_tag()} {mcore_weights_name=} {param.shape=} {mcore_weights.shape=}"
             for partition_dim, (s1, s2) in enumerate(
                 zip(param.shape, mcore_weights.shape)
             ):

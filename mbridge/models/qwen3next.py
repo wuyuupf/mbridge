@@ -11,6 +11,7 @@ class Qwen3NextBridge(LLMBridge):
         "output_layer.weight": "lm_head.weight",
     }
     _ATTENTION_MAPPING = {
+        # legacy
         "self_attention.linear_proj.weight": [
             "model.layers.{layer_number}.self_attn.o_proj.weight"
         ],
@@ -32,6 +33,47 @@ class Qwen3NextBridge(LLMBridge):
             "model.layers.{layer_number}.self_attn.q_proj.bias",
             "model.layers.{layer_number}.self_attn.k_proj.bias",
             "model.layers.{layer_number}.self_attn.v_proj.bias",
+        ],
+        # gated delta net
+        "self_attention.A_log": [
+            "model.layers.{layer_number}.linear_attn.A_log",
+        ],
+        "self_attention.dt_bias": [
+            "model.layers.{layer_number}.linear_attn.dt_bias",
+        ],
+        "self_attention.conv1d.weight": [
+            "model.layers.{layer_number}.linear_attn.conv1d.weight",
+        ],
+        "self_attention.in_proj_qkvz.weight": [
+            "model.layers.{layer_number}.linear_attn.in_proj_qkvz.weight",
+        ],
+        "self_attention.in_proj_ba.weight": [
+            "model.layers.{layer_number}.linear_attn.in_proj_ba.weight",
+        ],
+        "self_attention.out_proj.weight": [
+            "model.layers.{layer_number}.linear_attn.out_proj.weight",
+        ],
+        "self_attention.norm.weight": [
+            "model.layers.{layer_number}.linear_attn.norm.weight",
+        ],
+        # gated attention
+        "self_attention.q_proj.weight": [
+            "model.layers.{layer_number}.self_attn.q_proj.weight",
+        ],
+        "self_attention.k_proj.weight": [
+            "model.layers.{layer_number}.self_attn.k_proj.weight",
+        ],
+        "self_attention.v_proj.weight": [
+            "model.layers.{layer_number}.self_attn.v_proj.weight",
+        ],
+        "self_attention.q_norm.weight": [
+            "model.layers.{layer_number}.self_attn.q_norm.weight",
+        ],
+        "self_attention.k_norm.weight": [
+            "model.layers.{layer_number}.self_attn.k_norm.weight",
+        ],
+        "self_attention.o_proj.weight": [
+            "model.layers.{layer_number}.self_attn.o_proj.weight",
         ],
     }
     _MLP_MAPPING = {
@@ -57,9 +99,15 @@ class Qwen3NextBridge(LLMBridge):
             "model.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"
         ],
     }
+    _OTHER_MAPPING = {
+        # input layernorm
+        "input_layernorm.weight": [
+            "model.layers.{layer_number}.input_layernorm.weight",
+        ],
+    }
 
     def _build_config(self):
-        return self._build_base_config(
+        tf_config = self._build_base_config(
             use_cpu_initialization=False,
             # MoE specific
             moe_ffn_hidden_size=self.hf_config.moe_intermediate_size,
@@ -78,7 +126,27 @@ class Qwen3NextBridge(LLMBridge):
             # Qwen specific
             moe_router_pre_softmax=False,
             qk_layernorm=True,
+            # Qwen3Next specific
+            is_hybrid_model=True,
+            multi_latent_attention=True,
+            layernorm_zero_centered_gamma=True,
+            mtp_num_layers=1,
+            moe_shared_expert_intermediate_size=self.hf_config.shared_expert_intermediate_size,
         )
+
+        # if not hasattr(tf_config, "get_config_for_layer"):
+
+        #     def _get_config_for_layer(self, layer_num: int):
+        #         # For our use-case, per-layer dims don’t change, so return self.
+        #         return self
+
+        #     import types
+
+        #     tf_config.get_config_for_layer = types.MethodType(
+        #         _get_config_for_layer, tf_config
+        #     )
+
+        return tf_config
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
         layer_number = name.split(".")[2]
